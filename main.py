@@ -20,24 +20,43 @@ class VAE(nn.Module):
         self.encoder_conv1 = nn.Conv(features=64, kernel_size=(5,), padding='CAUSAL')
         self.encoder_conv2 = nn.Conv(features=64, kernel_size=(5,), padding='CAUSAL')
         self.encoder_dense = nn.Dense(self.latent_dim)
+        self.sigma_head = nn.Dense(self.latent_dim)
         
         # Decoder: MLP to map from manifold back to signal space
         self.decoder_hidden = nn.Dense(128)
         self.decoder_out = nn.Dense(self.input_dim)
 
-    def __call__(self, x):
+    def __call__(self, x, rng):
         # Encoder
         h = nn.relu(self.encoder_conv1(x))
         h = nn.relu(self.encoder_conv2(h))
-        z_raw = self.encoder_dense(h)
         
-        norm = jnp.linalg.norm(z_raw, axis=-1, keepdims=True)
-        z = z_raw / jnp.maximum(norm, 1e-8)
+        # Predict mu (on manifold) and sigma (tangent space concentration)
+        mu_raw = self.encoder_dense(h)
+        mu = mu_raw / jnp.maximum(jnp.linalg.norm(mu_raw, axis=-1, keepdims=True), 1e-8)
+        
+        # Sigma parameterizes the scale in tangent space
+        sigma = self.sigma_head(h)
+        sigma = nn.softplus(sigma) + 1e-5 # Positive scale
+        
+        # Tangent Space Sampling (Riemannian VAE)
+        # 1. Sample epsilon ~ N(0, I)
+        epsilon = jrandom.normal(rng, shape=mu.shape)
+        
+        # 2. Project to Tangent Space of mu
+        # v_raw = epsilon * sigma
+        v_raw = epsilon * sigma
+        dot = jnp.sum(v_raw * mu, axis=-1, keepdims=True)
+        v_tan = v_raw - dot * mu
+        
+        # 3. Exponential Map: z = exp_mu(v_tan)
+        norm_v = jnp.linalg.norm(v_tan, axis=-1, keepdims=True)
+        z = jnp.cos(norm_v) * mu + jnp.sin(norm_v) * (v_tan / jnp.maximum(norm_v, 1e-8))
         
         # Decoder (Pointwise)
         recon = self.decode(z)
         
-        return recon, z
+        return recon, z, mu, sigma
 
     def decode(self, z):
         h_dec = nn.relu(self.decoder_hidden(z))
@@ -152,22 +171,22 @@ class ManifoldFormer(nn.Module):
         self.dynamics = Dynamics(self.latent_dim)
         self.iso_scale = self.param('iso_scale', nn.initializers.ones, (1,))
 
-    def __call__(self, x):
-        recon_vae, z = self.vae(x)
+    def __call__(self, x, rng):
+        recon_vae, z, mu, sigma = self.vae(x, rng)
         z_dyn = self.dynamics(z)
         
         # Decode the dynamic state
         out = self.vae.decode(z_dyn)
         
-        return out, recon_vae, z, z_dyn, self.iso_scale
+        return out, recon_vae, z, z_dyn, self.iso_scale, mu, sigma
 
 # --- Loss Function ---
 
-def loss_fn(params, state, x, y):
-    pred, recon_vae, z, z_dyn, iso_scale = state.apply_fn({'params': params}, x)
+def loss_fn(params, state, x, y_pred_target, y_recon_target, rng):
+    pred, recon_vae, z, z_dyn, iso_scale, mu, sigma = state.apply_fn({'params': params}, x, rng)
     
-    l_recon = jnp.mean((pred - y) ** 2)
-    l_recon_vae = jnp.mean((recon_vae - x) ** 2)
+    l_recon = jnp.mean((pred - y_pred_target) ** 2)
+    l_recon_vae = jnp.mean((recon_vae - y_recon_target) ** 2)
     
     # Geodesic smoothness on the sphere
     dot_product = jnp.sum(z_dyn * z, axis=-1).clip(-1.0 + 1e-6, 1.0 - 1e-6)
@@ -184,7 +203,16 @@ def loss_fn(params, state, x, y):
     
     l_iso = jnp.mean((iso_scale * dist_z - dist_x) ** 2)
     
-    return l_recon + l_recon_vae + 0.1 * l_smooth + 0.01 * l_iso
+    # KL Divergence for Riemannian Normal (Approximate)
+    # KL(N_M(mu, sigma) || U_M) ~ -Entropy
+    # For small sigma, it behaves like Euclidean KL on tangent space.
+    # KL ~ -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2) ? No, prior is Uniform on Sphere?
+    # Or prior is Standard Normal on Tangent Space?
+    # Let's assume prior is N(0, I) on tangent space (wrapped).
+    # Then KL is standard Gaussian KL on the tangent coefficients.
+    l_kl = -0.5 * jnp.mean(1 + jnp.log(sigma ** 2) - sigma ** 2)
+    
+    return l_recon + l_recon_vae + 0.1 * l_smooth + 0.01 * l_iso + 0.001 * l_kl
 
 # --- Data Generation ---
 
@@ -201,21 +229,41 @@ class SyntheticChordsDataset:
     def __getitem__(self, idx):
         t = np.linspace(0, 4 * np.pi, self.seq_len)
         
-        signals = []
+
+        # Return (Noisy Input, Clean Target)
+        # We need to generate the clean version again or store it.
+        # Let's refactor to generate clean first, then add noise.
+        
+        clean_signals = []
+        noisy_signals = []
+        
         for _ in range(self.batch_size):
             freqs = np.random.choice([1, 2, 3, 5, 8], size=3, replace=False)
-            signal = np.zeros((self.seq_len, self.channels))
+            clean_signal = np.zeros((self.seq_len, self.channels))
+            noisy_signal = np.zeros((self.seq_len, self.channels))
             
             for ch in range(self.channels):
                 phase_shift = (ch / self.channels) * 2 * np.pi
                 wave = (np.sin(freqs[0] * t + phase_shift) + 
                         0.5 * np.sin(freqs[1] * t + phase_shift) + 
                         0.25 * np.sin(freqs[2] * t + phase_shift))
-                signal[:, ch] = wave + np.random.normal(0, 0.1, size=len(t))
-            signals.append(signal)
+                clean_signal[:, ch] = wave
+                noisy_signal[:, ch] = wave + np.random.normal(0, 0.1, size=len(t))
             
-        signals = np.array(signals)
-        return signals[:, :-1, :], signals[:, 1:, :]
+            clean_signals.append(clean_signal)
+            noisy_signals.append(noisy_signal)
+            
+        clean_signals = np.array(clean_signals)
+        noisy_signals = np.array(noisy_signals)
+        
+        # Input: Noisy [0:-1]
+        # Target: Clean [1:] (for prediction) and Clean [0:-1] (for reconstruction)
+        # Actually, let's keep it simple:
+        # x = Noisy [0:-1]
+        # y_pred_target = Clean [1:]
+        # y_recon_target = Clean [0:-1]
+        
+        return noisy_signals[:, :-1, :], clean_signals[:, 1:, :], clean_signals[:, :-1, :]
 
 # --- Audio Saving ---
 
@@ -252,7 +300,8 @@ def geodesic_imputation(model, params, sequence_with_gap, gap_start, gap_end, ke
     original_seq_len = sequence_with_gap.shape[0]
 
     # 1. Encode the full sequence to get the context before the gap
-    _, z_full_latent = model.apply({'params': params}, sequence_with_gap, method=lambda module, x: module.vae(x))
+    # We need to pass a key for the VAE
+    _, z_full_latent, _, _ = model.apply({'params': params}, sequence_with_gap, key, method=lambda module, x, rng: module.vae(x, rng))
     
     # We start with the valid history up to the gap
     # Shape: (1, T, D) - adding batch dim for the model
@@ -353,24 +402,30 @@ def main():
     synth_ds = SyntheticChordsDataset(num_samples=10 * batch_size, seq_len=seq_len, channels=channels, batch_size=batch_size)
     
     @jax.jit
-    def train_step(state, x, y):
-        grads = jax.grad(loss_fn)(state.params, state, x, y)
+    def train_step(state, x, y_pred, y_recon, rng):
+        rng, key = jrandom.split(rng)
+        grads = jax.grad(loss_fn)(state.params, state, x, y_pred, y_recon, key)
         state = state.apply_gradients(grads=grads)
-        return state
+        return state, rng
 
     # Adjust sequence length for next-step prediction
     train_seq_len = seq_len - 1
 
-    params = model.init(key, jnp.ones((batch_size, train_seq_len, channels)))['params']
+    # Init with RNG
+    init_rng, train_rng = jrandom.split(key)
+    params = model.init(init_rng, jnp.ones((batch_size, train_seq_len, channels)), init_rng)['params']
     optimizer = optax.adamw(1e-3)
     state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
     
     for epoch in range(num_epochs):
         total_loss = 0
         for i in range(len(synth_ds)):
-            x, y = synth_ds[i]
-            state = train_step(state, x, y)
-            loss = loss_fn(state.params, state, x, y)
+            x, y_pred, y_recon = synth_ds[i]
+            state, train_rng = train_step(state, x, y_pred, y_recon, train_rng)
+            
+            # For logging, we need a key for loss_fn too if we call it outside
+            train_rng, log_key = jrandom.split(train_rng)
+            loss = loss_fn(state.params, state, x, y_pred, y_recon, log_key)
             total_loss += loss
         avg_loss = total_loss / len(synth_ds)
         print(f"Epoch {epoch+1}/{num_epochs}, Avg Loss: {avg_loss:.4f}")
@@ -378,8 +433,13 @@ def main():
     print("\n--- Training Complete ---")
     
     # Reconstruct a full sequence for imputation demo
-    sample_x, sample_y = synth_ds[0]
-    sample_input = jnp.concatenate([sample_x[0], sample_y[0][-1][None, :]], axis=0)
+    sample_x, sample_y_pred, sample_y_recon = synth_ds[0]
+    # sample_x is (B, T-1, C)
+    # sample_y_pred is (B, T-1, C) (shifted by 1)
+    # We want to reconstruct the full sequence.
+    # Let's just use the first sample's full length from the dataset generation logic?
+    # Or just stitch x and the last of y.
+    sample_input = jnp.concatenate([sample_x[0], sample_y_pred[0][-1][None, :]], axis=0)
 
     print("\n--- Demonstrating Geodesic Imputation ---")
     gap_start_idx = seq_len // 4
@@ -388,7 +448,11 @@ def main():
     input_with_gap = np.copy(sample_input)
     input_with_gap[gap_start_idx:gap_end_idx, :] = 0.0
     
-    imputed_output = geodesic_imputation(model, state.params, input_with_gap, gap_start_idx, gap_end_idx, key)
+    input_with_gap[gap_start_idx:gap_end_idx, :] = 0.0
+    
+    # Pass a key for the VAE sampling in imputation
+    impute_key, _ = jrandom.split(key)
+    imputed_output = geodesic_imputation(model, state.params, input_with_gap, gap_start_idx, gap_end_idx, impute_key)
     
     save_audio(imputed_output, "imputed_audio_sample.wav")
     
@@ -413,8 +477,9 @@ def main():
 
     print("\n--- Generating Phase Portrait ---")
     # Get latent trajectory for the sample input
-    _, z_sample = model.apply({'params': state.params}, sample_input[None, ...], method=lambda m, x: m.vae(x))
-    plot_phase_portrait(z_sample[0])
+    # Use the mean (mu) for the phase portrait to show the "clean" manifold
+    _, _, z_sample_mu, _ = model.apply({'params': state.params}, sample_input[None, ...], key, method=lambda m, x, rng: m.vae(x, rng))
+    plot_phase_portrait(z_sample_mu[0])
 
 if __name__ == '__main__':
     main()
