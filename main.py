@@ -1,348 +1,360 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import jax
+import jax.numpy as jnp
+import jax.random as jrandom
+from flax.training import train_state
+import flax.linen as nn
 import numpy as np
 import matplotlib.pyplot as plt
-from torch.utils.data import Dataset, DataLoader
-from scipy.io import wavfile # Using scipy for audio saving
-import torch.optim as optim # Import optimizer
+from scipy.io import wavfile
+import optax
+import sys
 
-# Placeholder classes (as defined previously)
-class RiemannianVAE(nn.Module):
-    def __init__(self, input_dim, latent_dim):
-        super().__init__()
-        self.encoder = nn.Linear(input_dim, latent_dim)
-        self.decoder = nn.Linear(latent_dim, input_dim)
+# --- Flax Model Components ---
 
-    def forward(self, x):
-        z = self.encoder(x)
-        recon = self.decoder(z)
+class VAE(nn.Module):
+    input_dim: int
+    latent_dim: int
+
+    def setup(self):
+        # Encoder: Causal Convolution to capture temporal context (phase/velocity)
+        self.encoder_conv1 = nn.Conv(features=64, kernel_size=(5,), padding='CAUSAL')
+        self.encoder_conv2 = nn.Conv(features=64, kernel_size=(5,), padding='CAUSAL')
+        self.encoder_dense = nn.Dense(self.latent_dim)
+        
+        # Decoder: MLP to map from manifold back to signal space
+        self.decoder_hidden = nn.Dense(128)
+        self.decoder_out = nn.Dense(self.input_dim)
+
+    def __call__(self, x):
+        # Encoder
+        h = nn.relu(self.encoder_conv1(x))
+        h = nn.relu(self.encoder_conv2(h))
+        z_raw = self.encoder_dense(h)
+        
+        norm = jnp.linalg.norm(z_raw, axis=-1, keepdims=True)
+        z = z_raw / jnp.maximum(norm, 1e-8)
+        
+        # Decoder (Pointwise)
+        recon = self.decode(z)
+        
         return recon, z
 
-class GeodesicAttention(nn.Module):
-    def __init__(self, latent_dim):
-        super().__init__()
-        self.query = nn.Linear(latent_dim, latent_dim)
-        self.key = nn.Linear(latent_dim, latent_dim)
-        self.value = nn.Linear(latent_dim, latent_dim)
+    def decode(self, z):
+        h_dec = nn.relu(self.decoder_hidden(z))
+        return self.decoder_out(h_dec)
 
-    def forward(self, x):
-        q = self.query(x)
-        k = self.key(x)
-        v = self.value(x)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1))
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        output = torch.matmul(attn_weights, v)
-        return output
+class Dynamics(nn.Module):
+    latent_dim: int
+    memory_gamma: float = 0.5  # Power-law decay parameter
+    memory_kernel_size: int = 256
 
-class MoEFeedForward(nn.Module):
-    def __init__(self, latent_dim, num_experts=2):
-        super().__init__()
-        self.experts = nn.ModuleList([nn.Sequential(
-            nn.Linear(latent_dim, latent_dim * 2),
-            nn.GELU(),
-            nn.Linear(latent_dim * 2, latent_dim)
-        ) for _ in range(num_experts)])
-        self.gate = nn.Linear(latent_dim, num_experts)
+    @nn.compact
+    def __call__(self, z):
+        # z has shape (batch, seq_len, latent_dim)
 
-    def forward(self, x):
-        gate_logits = self.gate(x)
-        expert_weights = F.softmax(gate_logits, dim=-1)
-        
-        outputs = [expert(x) for expert in self.experts]
-        outputs = torch.stack(outputs, dim=-1)
-        
-        output = (outputs * expert_weights.unsqueeze(-2)).sum(dim=-1)
-        return output
+        # 1. Power-Law Memory Integral (Causal Convolution)
+        # We need to process each latent dimension independently.
+        # Flax Conv expects (Batch, Length, Channels). We treat latent_dim as channels.
+        kernel = self.param(
+            'memory_kernel',
+            lambda key, shape, dtype: get_fractional_kernel(self.memory_gamma, self.memory_kernel_size),
+            (self.memory_kernel_size, 1, 1), jnp.float32
+        )
+        # Apply causal convolution across the time dimension for each latent feature
+        memory_force = nn.Conv(
+            features=self.latent_dim,
+            kernel_size=(self.memory_kernel_size,),
+            feature_group_count=self.latent_dim,  # Depthwise convolution
+            padding='CAUSAL'
+        )(z)
 
-# ==========================================
-# 1. NEW COMPONENT: Neural Kuramoto ODE Layer
-# ==========================================
-class KuramotoInteraction(nn.Module):
-    """
-    Vectorized Kuramoto Oscillator coupling.
-    Stores 'last_attn_weights' for visualization.
-    """
-    def __init__(self, dim, num_heads=4):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
+        # 2. Projected Kuramoto Coupling (Attention-like mechanism)
+        q = nn.Dense(self.latent_dim, name="Q_proj")(z)
+        k = nn.Dense(self.latent_dim, name="K_proj")(z)
         
-        self.omega = nn.Parameter(torch.randn(1, 1, dim) * 0.1)
-        self.to_coupling = nn.Linear(dim, dim * 2, bias=False)
-        self.output = nn.Linear(dim, dim)
-        
-        # Buffer to store weights for visualization
-        self.last_attn_weights = None
+        q_hat = q / jnp.maximum(jnp.linalg.norm(q, axis=-1, keepdims=True), 1e-8)
+        k_hat = k / jnp.maximum(jnp.linalg.norm(k, axis=-1, keepdims=True), 1e-8)
 
-    def forward(self, t, z):
-        B, T, D = z.shape
-        intrinsic_drift = self.omega 
-        
-        q, k = self.to_coupling(z).chunk(2, dim=-1)
-        q = q.view(B, T, self.num_heads, self.head_dim)
-        k = k.view(B, T, self.num_heads, self.head_dim)
-        
-        q = F.normalize(q, dim=-1)
-        k = F.normalize(k, dim=-1)
-        
-        q = q.permute(0, 2, 1, 3) # [B, H, T, D_h]
-        k = k.permute(0, 2, 1, 3)
-        
-        coupling = torch.matmul(q, k.transpose(-2, -1)) # [B, H, T, T]
-        
-        self.last_attn_weights = coupling.detach().cpu()
-        
-        interaction = torch.sin(coupling) 
-        force = torch.matmul(interaction, k)
-        force = force.permute(0, 2, 1, 3).reshape(B, T, D)
-        
-        return intrinsic_drift + self.output(force)
+        dots = jnp.einsum('btd,bTd->btT', q_hat, k_hat)
+        attn_weights = jnp.sin(dots)
 
-# ==========================================
-# 2. UPDATED COMPONENT: Geometric ODE Solver
-# ==========================================
-class GeometricDynamicsPredictor(nn.Module):
-    """ 
-    Replaces standard Neural ODE. 
-    [cite_start]Uses Kuramoto logic to model 'smooth neural state evolution'[cite: 22].
-    """
-    def __init__(self, dim):
-        super().__init__()
-        self.func = KuramotoInteraction(dim)
-        
-    def forward(self, z):
-        dt = 0.25
-        t = 0.0
-        x = z
-        
-        for _ in range(4):
-            x = F.normalize(x, p=2, dim=-1) 
-            
-            k1 = self.func(t, x)
-            k2 = self.func(t + dt/2, x + dt/2 * k1)
-            k3 = self.func(t + dt/2, x + dt/2 * k2)
-            k4 = self.func(t + dt, x + dt * k3)
-            
-            x = x + (dt/6) * (k1 + 2*k2 + 2*k3 + k4)
-            t += dt
-            
-        return F.normalize(x, p=2, dim=-1)
+        kuramoto_force_raw = jnp.einsum('btT,bTd->btd', attn_weights, k_hat)
+        kuramoto_force = nn.Dense(self.latent_dim, name="Out_proj")(kuramoto_force_raw)
 
-# ==========================================
-# 3. UPDATED MODEL: ManifoldFormer
-# ==========================================
+        # 3. Combine forces and project to tangent space
+        combined_force = memory_force + kuramoto_force
+        
+        dot_prod_vz = jnp.sum(combined_force * z, axis=-1, keepdims=True)
+        tangent_velocity = combined_force - dot_prod_vz * z
+
+        # 4. Integrate and project back to the manifold (Retraction)
+        z_next_ambient = z + tangent_velocity
+        norm = jnp.linalg.norm(z_next_ambient, axis=-1, keepdims=True)
+        z_dyn = z_next_ambient / jnp.maximum(norm, 1e-8)
+        
+        return z_dyn
+
 class ManifoldFormer(nn.Module):
-    def __init__(self, input_dim=4800, latent_dim=128):
-        super().__init__()
-        self.vae = RiemannianVAE(input_dim, latent_dim)
-        
-        self.ln1 = nn.LayerNorm(latent_dim)
-        self.attn = GeodesicAttention(latent_dim)
-        self.ln2 = nn.LayerNorm(latent_dim)
-        self.moe = MoEFeedForward(latent_dim)
-        
-        self.ode = GeometricDynamicsPredictor(latent_dim)
-        
-        self.head = nn.Linear(latent_dim, input_dim)
+    input_dim: int
+    latent_dim: int
 
-    def forward(self, x):
+    def setup(self):
+        self.vae = VAE(self.input_dim, self.latent_dim)
+        self.dynamics = Dynamics(self.latent_dim)
+
+    def __call__(self, x):
         recon_vae, z = self.vae(x)
+        z_dyn = self.dynamics(z)
         
-        z_trans = z + self.attn(self.ln1(z))
-        z_trans = z_trans + self.moe(self.ln2(z_trans))
+        # Decode the dynamic state
+        out = self.vae.decode(z_dyn)
         
-        z_dyn = self.ode(z_trans)
-        
-        out = self.head(z_dyn)
-        
-        return out, recon_vae, z, z_trans, z_dyn
+        return out, recon_vae, z, z_dyn
 
-# ==========================================
-# 4. UPDATED LOSS: Temporal Geometric Loss
-# ==========================================
-def temporal_geometric_loss(pred, target, z_latent, z_dyn, alpha=1.0, beta=0.1, gamma=0.01):
-    """
-    Combines Reconstruction, Manifold Alignment, and Temporal Stability.
-    """
-    l_recon = F.mse_loss(pred, target)
-    
-    idx = torch.randperm(target.size(0))
-    x_flat = target.mean(dim=1)
-    z_flat = z_latent.mean(dim=1)
-    d_input = torch.norm(x_flat - x_flat[idx], p=2, dim=-1)
-    dot = (z_flat * z_flat[idx]).sum(dim=-1).clamp(-0.99, 0.99)
-    d_geo = torch.acos(dot)
-    l_geo = F.mse_loss(d_geo, d_input)
-    
-    norm_violation = (torch.norm(z_dyn, p=2, dim=-1) - 1.0).pow(2).mean()
-    
-    l_smooth = F.mse_loss(z_dyn[:, 1:, :], z_dyn[:, :-1, :])
-    
-    return l_recon + alpha*l_geo + beta*norm_violation + gamma*l_smooth
+# --- Loss Function ---
 
-def visualize_neural_synchronization(model, input_batch):
-    """
-    Runs a forward pass and visualizes the Kuramoto dynamics, saving plots to files.
-    """
-    model.eval()
-    with torch.no_grad():
-        _, _, _, _, z_dyn = model(input_batch)
-        
-        attn_weights = model.ode.func.last_attn_weights
-        
-        latent_phases = z_dyn.cpu()
-
-    plt.figure(figsize=(6, 5))
-    sync_map = attn_weights[0, 0, :, :].numpy() 
+def loss_fn(params, state, x, y):
+    pred, recon_vae, z, z_dyn = state.apply_fn({'params': params}, x)
     
-    plt.imshow(sync_map, cmap='viridis', interpolation='nearest')
-    plt.colorbar(label="Coupling Strength (Phase Sync)")
-    plt.title("Neural Phase Synchronization\n(Time x Time Coupling)")
-    plt.xlabel("Target Time Step")
-    plt.ylabel("Source Time Step")
-    plt.tight_layout()
-    plt.savefig("sync_map.png")
-    plt.close()
+    l_recon = jnp.mean((pred - y) ** 2)
+    l_recon_vae = jnp.mean((recon_vae - x) ** 2)
     
-    print("Saved 'sync_map.png'")
-
-    plt.figure(figsize=(6, 5))
+    # Geodesic smoothness on the sphere
+    dot_product = jnp.sum(z_dyn * z, axis=-1).clip(-1.0, 1.0)
+    geodesic_dist = jnp.arccos(dot_product)
+    l_smooth = jnp.mean(geodesic_dist ** 2)
     
-    c = latent_phases[0][:, 0]
-    s = latent_phases[0][:, 1]
-    angles = np.arctan2(s, c)
-    radii = np.ones_like(angles)
-    
-    colors = np.linspace(0, 1, len(angles)) # Define colors here
-    plt.subplot(projection='polar')
-    plt.scatter(angles, radii, c=colors, cmap='plasma', alpha=0.75, s=50)
-    plt.title("Latent Oscillator Phases\n(Color = Time Evolution)")
-    plt.yticks([])
-    plt.tight_layout()
-    plt.savefig("phase_portrait.png")
-    plt.close()
+    return l_recon + l_recon_vae + 0.1 * l_smooth
 
-    print("Saved 'phase_portrait.png'")
+# --- Data Generation ---
 
-class SyntheticChordsDataset(Dataset):
-    """
-    Generates synthetic 'music' consisting of moving chords.
-    Perfect for testing if Kuramoto dynamics can lock onto frequencies.
-    """
-    def __init__(self, num_samples=1000, seq_len=128, channels=64):
+class SyntheticChordsDataset:
+    def __init__(self, num_samples=1000, seq_len=128, channels=64, batch_size=16):
         self.num_samples = num_samples
         self.seq_len = seq_len
         self.channels = channels
+        self.batch_size = batch_size
         
     def __len__(self):
-        return self.num_samples
+        return self.num_samples // self.batch_size
     
     def __getitem__(self, idx):
-        t = np.linspace(0, 4*np.pi, self.seq_len)
+        t = np.linspace(0, 4 * np.pi, self.seq_len)
         
-        freqs = np.random.choice([1, 2, 3, 5, 8], size=3, replace=False)
-        
-        signal = np.zeros((self.seq_len, self.channels))
-        
-        for ch in range(self.channels):
-            phase_shift = (ch / self.channels) * 2 * np.pi
-            wave = (np.sin(freqs[0]*t + phase_shift) + 
-                    0.5 * np.sin(freqs[1]*t + phase_shift) + 
-                    0.25 * np.sin(freqs[2]*t + phase_shift))
+        signals = []
+        for _ in range(self.batch_size):
+            freqs = np.random.choice([1, 2, 3, 5, 8], size=3, replace=False)
+            signal = np.zeros((self.seq_len, self.channels))
             
-            signal[:, ch] = wave + np.random.normal(0, 0.1, size=len(t))
+            for ch in range(self.channels):
+                phase_shift = (ch / self.channels) * 2 * np.pi
+                wave = (np.sin(freqs[0] * t + phase_shift) + 
+                        0.5 * np.sin(freqs[1] * t + phase_shift) + 
+                        0.25 * np.sin(freqs[2] * t + phase_shift))
+                signal[:, ch] = wave + np.random.normal(0, 0.1, size=len(t))
+            signals.append(signal)
             
-        return torch.FloatTensor(signal), torch.FloatTensor(signal) # Input, Target
+        signals = np.array(signals)
+        return signals[:, :-1, :], signals[:, 1:, :]
 
-# Removed GTZANMelDataset (as it's commented out and torchaudio is no longer used)
-# Removed torchaudio and os imports
+# --- Audio Saving ---
 
-# Helper function to save audio
+def get_fractional_kernel(gamma, kernel_size, device=None):
+    """
+    Generates the discrete approximation of the fractional integral kernel
+    (t-tau)^(-gamma) / Gamma(1-gamma) for a causal convolution.
+    """
+    t = jnp.arange(1, kernel_size + 1, dtype=jnp.float32)
+    
+    # Using JAX's lgamma for the log of the Gamma function
+    gamma_val = jnp.exp(jax.lax.lgamma(1 - jnp.array(gamma)))
+    weights = (1.0 / gamma_val) * (t ** (-gamma))
+    
+    # Reshape for conv1d: (Out_channels, In_channels, Time) -> (Length, In, Out) for Flax
+    return weights[::-1].reshape(kernel_size, 1, 1)
+
+
 def save_audio(tensor, filename, sample_rate=22050):
-    """
-    Saves a given tensor as an audio file using scipy.io.wavfile.
-    Assumes tensor is [Time, Channels] or [Time].
-    If multichannel, saves first channel for simplicity.
-    Normalizes to -1 to 1 and converts to 16-bit PCM.
-    """
-    if tensor.ndim == 2: # [Time, Channels]
-        audio_data = tensor[:, 0] # Take first channel
-    else: # [Time]
-        audio_data = tensor
-    
-    # Move to CPU and convert to numpy
-    audio_data_np = audio_data.cpu().numpy()
-
-    # Normalize to -1 to 1 range (assuming float input)
-    audio_data_np = audio_data_np / np.max(np.abs(audio_data_np))
-    
-    # Convert to 16-bit PCM for WAV file
+    audio_data = tensor[:, 0] if tensor.ndim == 2 else tensor
+    audio_data_np = np.array(audio_data)
+    audio_data_np /= np.max(np.abs(audio_data_np))
     audio_data_np = (audio_data_np * 32767).astype(np.int16)
-
     wavfile.write(filename, sample_rate, audio_data_np)
     print(f"Saved audio to {filename}")
 
+# --- Imputation ---
+
+def geodesic_imputation(model, params, sequence_with_gap, gap_start, gap_end, key, epsilon=1e-7):
+    """
+    Imputes a gap using the learned Manifold ODE dynamics (Autoregressive Rollout).
+    This follows the 'geodesic' flow of the dynamical system, preserving phase and frequency.
+    """
+    original_seq_len = sequence_with_gap.shape[0]
+
+    # 1. Encode the full sequence to get the context before the gap
+    _, z_full_latent = model.apply({'params': params}, sequence_with_gap, method=lambda module, x: module.vae(x))
+    
+    # We start with the valid history up to the gap
+    # Shape: (1, T, D) - adding batch dim for the model
+    current_z_seq = z_full_latent[:gap_start][None, ...] 
+    
+    # We need to generate up to the end of the shadow region (to fix the encoder corruption)
+    # The encoder receptive field is ~16.
+    receptive_field = 16
+    fill_end = min(gap_end + receptive_field, original_seq_len)
+    steps_to_generate = fill_end - gap_start
+    
+    print(f"Autoregressively generating {steps_to_generate} steps using learned dynamics...")
+    
+    # JIT compile the single-step prediction for speed
+    @jax.jit
+    def predict_step(seq, params):
+        z_dyn_seq = model.apply({'params': params}, seq, method=lambda m, x: m.dynamics(x))
+        return z_dyn_seq[:, -1:, :]
+
+    for _ in range(steps_to_generate):
+        # Predict the next state from the current history
+        # The Dynamics module returns the evolved state for each step.
+        # We want the evolution of the LAST step in the current sequence.
+        next_z = predict_step(current_z_seq, params)
+        
+        # Enforce manifold constraint (just in case, though dynamics should do it)
+        norm = jnp.linalg.norm(next_z, axis=-1, keepdims=True)
+        next_z = next_z / jnp.maximum(norm, epsilon)
+        
+        # Append to history
+        current_z_seq = jnp.concatenate([current_z_seq, next_z], axis=1)
+        
+    # Extract the generated segment (excluding the history we started with)
+    # The generated part starts at index gap_start
+    generated_segment = current_z_seq[0, gap_start:]
+    
+    # Splice it back into the full latent sequence
+    # We replace from gap_start to fill_end
+    z_imputed_full = z_full_latent.at[gap_start:fill_end].set(generated_segment)
+    
+    # Decode the imputed sequence.
+    imputed_output = model.apply({'params': params}, z_imputed_full, method=lambda module, x: module.vae.decode(x))
+    return imputed_output
+
+# --- Visualization ---
+
+def plot_phase_portrait(z_traj, filename="phase_portrait.png"):
+    """
+    Plots the phase portrait of the latent trajectory using PCA.
+    """
+    # z_traj shape: (Seq_Len, Latent_Dim)
+    # Center the data
+    z_centered = z_traj - jnp.mean(z_traj, axis=0)
+    
+    # PCA via SVD
+    # U: (T, T), S: (K,), Vt: (K, D) where K = min(T, D)
+    _, _, Vt = jnp.linalg.svd(z_centered, full_matrices=False)
+    
+    # Project to top 2 components
+    # z_pca = z_centered @ Vt.T[:, :2]
+    z_pca = jnp.dot(z_centered, Vt[:2, :].T)
+    
+    plt.figure(figsize=(8, 8))
+    plt.plot(z_pca[:, 0], z_pca[:, 1], label='Latent Trajectory', alpha=0.8)
+    plt.scatter(z_pca[0, 0], z_pca[0, 1], color='green', marker='o', s=100, label='Start')
+    plt.scatter(z_pca[-1, 0], z_pca[-1, 1], color='red', marker='x', s=100, label='End')
+    
+    # Draw direction arrows
+    for i in range(0, len(z_pca)-1, len(z_pca)//10):
+        plt.arrow(z_pca[i, 0], z_pca[i, 1], 
+                  z_pca[i+1, 0] - z_pca[i, 0], 
+                  z_pca[i+1, 1] - z_pca[i, 1], 
+                  shape='full', lw=0, length_includes_head=True, head_width=0.05, color='black')
+
+    plt.title("Latent Phase Portrait (PCA Projection)")
+    plt.xlabel("Principal Component 1")
+    plt.ylabel("Principal Component 2")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+    print(f"Saved '{filename}'")
+
+# --- Main ---
 
 def main():
-    # 1. Device configuration
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Using device: {device}')
-
-    # 2. Synthetic Dataset and DataLoader
-    seq_len = 128
-    channels = 64
-    synth_ds = SyntheticChordsDataset(num_samples=100, seq_len=seq_len, channels=channels)
-    synth_loader = DataLoader(synth_ds, batch_size=4, shuffle=True)
-
-    # 3. Model, Optimizer, Loss Function
-    model = ManifoldFormer(input_dim=channels, latent_dim=32).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    key = jrandom.PRNGKey(0)
     
-    num_epochs = 10
-    print(f"\n--- Starting Training for {num_epochs} Epochs ---")
-
-    # For saving a sample after training
-    sample_input, sample_target = next(iter(synth_loader))
-    sample_input = sample_input[0:1].to(device) # Take one sample from the batch
-    sample_target = sample_target[0:1] # Keep on CPU for saving
+    seq_len = 256
+    channels = 16
+    latent_dim = 32
+    num_epochs = 20
+    batch_size = 64
     
-    # Save original sample audio
-    save_audio(sample_target[0].cpu(), "original_audio_sample.wav", sample_rate=22050)
+    model = ManifoldFormer(input_dim=channels, latent_dim=latent_dim)
+    
+    synth_ds = SyntheticChordsDataset(num_samples=10 * batch_size, seq_len=seq_len, channels=channels, batch_size=batch_size)
+    
+    @jax.jit
+    def train_step(state, x, y):
+        grads = jax.grad(loss_fn)(state.params, state, x, y)
+        state = state.apply_gradients(grads=grads)
+        return state
 
+    # Adjust sequence length for next-step prediction
+    train_seq_len = seq_len - 1
+
+    params = model.init(key, jnp.ones((batch_size, train_seq_len, channels)))['params']
+    optimizer = optax.adamw(1e-3)
+    state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
+    
     for epoch in range(num_epochs):
-        model.train()
         total_loss = 0
-        for batch_idx, (input_batch, target_batch) in enumerate(synth_loader):
-            input_batch = input_batch.to(device)
-            target_batch = target_batch.to(device)
-
-            optimizer.zero_grad()
-            out, recon_vae, z_latent, z_trans, z_dyn = model(input_batch)
-            
-            loss = temporal_geometric_loss(out, target_batch, z_latent, z_dyn)
-            
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        
-        avg_loss = total_loss / len(synth_loader)
+        for i in range(len(synth_ds)):
+            x, y = synth_ds[i]
+            state = train_step(state, x, y)
+            loss = loss_fn(state.params, state, x, y)
+            total_loss += loss
+        avg_loss = total_loss / len(synth_ds)
         print(f"Epoch {epoch+1}/{num_epochs}, Avg Loss: {avg_loss:.4f}")
-
+        
     print("\n--- Training Complete ---")
+    
+    # Reconstruct a full sequence for imputation demo
+    sample_x, sample_y = synth_ds[0]
+    sample_input = jnp.concatenate([sample_x[0], sample_y[0][-1][None, :]], axis=0)
 
-    # 4. Generate and save audio sample after training
-    model.eval()
-    with torch.no_grad():
-        generated_output, _, _, _, _ = model(sample_input)
-        # Assuming output is [1, Time, Channels]
-        generated_audio = generated_output[0].cpu() # Get the first sample, move to CPU
-        save_audio(generated_audio, "generated_audio_epoch_10.wav", sample_rate=22050)
+    print("\n--- Demonstrating Geodesic Imputation ---")
+    gap_start_idx = seq_len // 4
+    gap_end_idx = seq_len // 2
     
-    # 5. Run visualization for a trained model output
-    print("\n--- Displaying visualization for a trained model output ---")
-    visualize_neural_synchronization(model, sample_input)
+    input_with_gap = np.copy(sample_input)
+    input_with_gap[gap_start_idx:gap_end_idx, :] = 0.0
     
+    imputed_output = geodesic_imputation(model, state.params, input_with_gap, gap_start_idx, gap_end_idx, key)
+    
+    save_audio(imputed_output, "imputed_audio_sample.wav")
+    
+    plt.figure(figsize=(15, 6))
+    time_steps = np.arange(seq_len)
+    
+    plt.plot(time_steps, sample_input[:, 0], label='Original Signal (Channel 0)', alpha=0.7)
+    plt.plot(time_steps, input_with_gap[:, 0], label='Masked Input (Channel 0)', alpha=0.7, linestyle='--')
+    plt.plot(time_steps, imputed_output[:, 0], label='Imputed Signal (Channel 0)', color='red', linewidth=2)
+    
+    plt.axvspan(gap_start_idx, gap_end_idx - 1, color='gray', alpha=0.3, label='Imputed Region')
+    
+    plt.title('Geodesic Imputation Demonstration (Channel 0)')
+    plt.xlabel('Time Step')
+    plt.ylabel('Amplitude')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("imputation_demo.png")
+    plt.close()
+    print("Saved 'imputation_demo.png'")
+
+    print("\n--- Generating Phase Portrait ---")
+    # Get latent trajectory for the sample input
+    _, z_sample = model.apply({'params': state.params}, sample_input[None, ...], method=lambda m, x: m.vae(x))
+    plot_phase_portrait(z_sample[0])
 
 if __name__ == '__main__':
     main()
