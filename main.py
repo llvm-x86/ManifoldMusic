@@ -51,48 +51,97 @@ class Dynamics(nn.Module):
     @nn.compact
     def __call__(self, z):
         # z has shape (batch, seq_len, latent_dim)
+        B, T, D = z.shape
 
         # 1. Power-Law Memory Integral (Causal Convolution)
-        # We need to process each latent dimension independently.
-        # Flax Conv expects (Batch, Length, Channels). We treat latent_dim as channels.
+        # Pre-calculate the memory force field.
         kernel = self.param(
             'memory_kernel',
             lambda key, shape, dtype: get_fractional_kernel(self.memory_gamma, self.memory_kernel_size),
             (self.memory_kernel_size, 1, 1), jnp.float32
         )
-        # Apply causal convolution across the time dimension for each latent feature
         memory_force = nn.Conv(
             features=self.latent_dim,
             kernel_size=(self.memory_kernel_size,),
-            feature_group_count=self.latent_dim,  # Depthwise convolution
+            feature_group_count=self.latent_dim,
             padding='CAUSAL'
         )(z)
 
-        # 2. Projected Kuramoto Coupling (Attention-like mechanism)
-        q = nn.Dense(self.latent_dim, name="Q_proj")(z)
-        k = nn.Dense(self.latent_dim, name="K_proj")(z)
+        # 2. Prepare Kuramoto Components (Keys/Values)
+        # We treat the input sequence 'z' as the background field for the attention.
+        # Ideally, for RK4, the field should be dynamic, but for efficiency in parallel training,
+        # we assume the 'Keys' and 'Values' are fixed by the input trajectory,
+        # and only the 'Query' (the particle being evolved) changes during the RK4 substeps.
         
-        q_hat = q / jnp.maximum(jnp.linalg.norm(q, axis=-1, keepdims=True), 1e-8)
+        k_proj_layer = nn.Dense(self.latent_dim, name="K_proj")
+        q_proj_layer = nn.Dense(self.latent_dim, name="Q_proj")
+        out_proj_layer = nn.Dense(self.latent_dim, name="Out_proj")
+
+        k = k_proj_layer(z)
         k_hat = k / jnp.maximum(jnp.linalg.norm(k, axis=-1, keepdims=True), 1e-8)
-
-        dots = jnp.einsum('btd,bTd->btT', q_hat, k_hat)
-        attn_weights = jnp.sin(dots)
-
-        kuramoto_force_raw = jnp.einsum('btT,bTd->btd', attn_weights, k_hat)
-        kuramoto_force = nn.Dense(self.latent_dim, name="Out_proj")(kuramoto_force_raw)
-
-        # 3. Combine forces and project to tangent space
-        combined_force = memory_force + kuramoto_force
         
-        dot_prod_vz = jnp.sum(combined_force * z, axis=-1, keepdims=True)
-        tangent_velocity = combined_force - dot_prod_vz * z
+        # Causal Mask for Attention
+        # mask[i, j] = 1 if i >= j else 0
+        mask = jnp.tril(jnp.ones((T, T)))
+        mask = mask[None, :, :] # (1, T, T)
 
-        # 4. Integrate and project back to the manifold (Retraction)
-        z_next_ambient = z + tangent_velocity
-        norm = jnp.linalg.norm(z_next_ambient, axis=-1, keepdims=True)
-        z_dyn = z_next_ambient / jnp.maximum(norm, 1e-8)
+        # Define the Vector Field Function for RK4
+        # z_curr: (B, T, D) - The current estimate of the state at each time step
+        def vector_field(z_curr):
+            # Project z_curr to Query
+            q = q_proj_layer(z_curr)
+            q_hat = q / jnp.maximum(jnp.linalg.norm(q, axis=-1, keepdims=True), 1e-8)
+            
+            # Causal Attention: Query (Current) vs Keys (History/Context)
+            dots = jnp.einsum('btd,bTd->btT', q_hat, k_hat)
+            
+            # Apply Mask: Set future positions to -inf before softmax? 
+            # But this is Kuramoto (sin), not Softmax. 
+            # We just zero out the contributions from the future.
+            attn_weights = jnp.sin(dots) * mask
+            
+            # Compute Force
+            kuramoto_force_raw = jnp.einsum('btT,bTd->btd', attn_weights, k_hat)
+            kuramoto_force = out_proj_layer(kuramoto_force_raw)
+            
+            total_force = memory_force + kuramoto_force
+            
+            # Project to Tangent Space of z_curr
+            dot_prod = jnp.sum(total_force * z_curr, axis=-1, keepdims=True)
+            tangent_vel = total_force - dot_prod * z_curr
+            return tangent_vel
+
+        # 3. Projected RK4 Integration
+        h = 1.0 # Step size (1 time step)
         
-        return z_dyn
+        # Retraction Operator
+        def retract(z_base, v):
+            z_new = z_base + v
+            return z_new / jnp.maximum(jnp.linalg.norm(z_new, axis=-1, keepdims=True), 1e-8)
+
+        # RK4 Steps
+        # k1 = f(z)
+        k1 = vector_field(z)
+        
+        # k2 = f(Retract(z, h/2 * k1))
+        z_k2 = retract(z, 0.5 * h * k1)
+        k2 = vector_field(z_k2)
+        
+        # k3 = f(Retract(z, h/2 * k2))
+        z_k3 = retract(z, 0.5 * h * k2)
+        k3 = vector_field(z_k3)
+        
+        # k4 = f(Retract(z, h * k3))
+        z_k4 = retract(z, h * k3)
+        k4 = vector_field(z_k4)
+        
+        # Combine
+        v_final = (h / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        
+        # Final Retraction
+        z_next = retract(z, v_final)
+        
+        return z_next
 
 class ManifoldFormer(nn.Module):
     input_dim: int
@@ -101,6 +150,7 @@ class ManifoldFormer(nn.Module):
     def setup(self):
         self.vae = VAE(self.input_dim, self.latent_dim)
         self.dynamics = Dynamics(self.latent_dim)
+        self.iso_scale = self.param('iso_scale', nn.initializers.ones, (1,))
 
     def __call__(self, x):
         recon_vae, z = self.vae(x)
@@ -109,22 +159,32 @@ class ManifoldFormer(nn.Module):
         # Decode the dynamic state
         out = self.vae.decode(z_dyn)
         
-        return out, recon_vae, z, z_dyn
+        return out, recon_vae, z, z_dyn, self.iso_scale
 
 # --- Loss Function ---
 
 def loss_fn(params, state, x, y):
-    pred, recon_vae, z, z_dyn = state.apply_fn({'params': params}, x)
+    pred, recon_vae, z, z_dyn, iso_scale = state.apply_fn({'params': params}, x)
     
     l_recon = jnp.mean((pred - y) ** 2)
     l_recon_vae = jnp.mean((recon_vae - x) ** 2)
     
     # Geodesic smoothness on the sphere
-    dot_product = jnp.sum(z_dyn * z, axis=-1).clip(-1.0, 1.0)
+    dot_product = jnp.sum(z_dyn * z, axis=-1).clip(-1.0 + 1e-6, 1.0 - 1e-6)
     geodesic_dist = jnp.arccos(dot_product)
     l_smooth = jnp.mean(geodesic_dist ** 2)
     
-    return l_recon + l_recon_vae + 0.1 * l_smooth
+    # Scaled Isometry Loss
+    # Input distances (Euclidean)
+    dist_x = jnp.sqrt(jnp.sum((x[:, :, None, :] - x[:, None, :, :]) ** 2, axis=-1) + 1e-8)
+    
+    # Latent distances (Geodesic)
+    dot_z = jnp.einsum('btd,bTd->btT', z, z).clip(-1.0 + 1e-6, 1.0 - 1e-6)
+    dist_z = jnp.arccos(dot_z)
+    
+    l_iso = jnp.mean((iso_scale * dist_z - dist_x) ** 2)
+    
+    return l_recon + l_recon_vae + 0.1 * l_smooth + 0.01 * l_iso
 
 # --- Data Generation ---
 
