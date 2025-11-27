@@ -131,34 +131,38 @@ class Dynamics(nn.Module):
             return tangent_vel
 
         # 3. Projected RK4 Integration
-        h = 1.0 # Step size (1 time step)
+        # We use substepping to increase fidelity of the integration
+        substeps = 4
+        h = 1.0 / substeps
         
         # Retraction Operator
         def retract(z_base, v):
             z_new = z_base + v
             return z_new / jnp.maximum(jnp.linalg.norm(z_new, axis=-1, keepdims=True), 1e-8)
 
-        # RK4 Steps
-        # k1 = f(z)
-        k1 = vector_field(z)
-        
-        # k2 = f(Retract(z, h/2 * k1))
-        z_k2 = retract(z, 0.5 * h * k1)
-        k2 = vector_field(z_k2)
-        
-        # k3 = f(Retract(z, h/2 * k2))
-        z_k3 = retract(z, 0.5 * h * k2)
-        k3 = vector_field(z_k3)
-        
-        # k4 = f(Retract(z, h * k3))
-        z_k4 = retract(z, h * k3)
-        k4 = vector_field(z_k4)
-        
-        # Combine
-        v_final = (h / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-        
-        # Final Retraction
-        z_next = retract(z, v_final)
+        z_next = z
+        for _ in range(substeps):
+            # RK4 Steps
+            # k1 = f(z)
+            k1 = vector_field(z_next)
+            
+            # k2 = f(Retract(z, h/2 * k1))
+            z_k2 = retract(z_next, 0.5 * h * k1)
+            k2 = vector_field(z_k2)
+            
+            # k3 = f(Retract(z, h/2 * k2))
+            z_k3 = retract(z_next, 0.5 * h * k2)
+            k3 = vector_field(z_k3)
+            
+            # k4 = f(Retract(z, h * k3))
+            z_k4 = retract(z_next, h * k3)
+            k4 = vector_field(z_k4)
+            
+            # Combine
+            v_final = (h / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+            
+            # Final Retraction for this substep
+            z_next = retract(z_next, v_final)
         
         return z_next
 
@@ -394,7 +398,7 @@ def main():
     seq_len = 256
     channels = 16
     latent_dim = 32
-    num_epochs = 20
+    num_epochs = 10
     batch_size = 64
     
     model = ManifoldFormer(input_dim=channels, latent_dim=latent_dim)
@@ -412,9 +416,11 @@ def main():
     train_seq_len = seq_len - 1
 
     # Init with RNG
+    # Init with RNG
     init_rng, train_rng = jrandom.split(key)
     params = model.init(init_rng, jnp.ones((batch_size, train_seq_len, channels)), init_rng)['params']
-    optimizer = optax.adamw(1e-3)
+    
+    optimizer = optax.adamw(learning_rate=1e-4)
     state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
     
     for epoch in range(num_epochs):
