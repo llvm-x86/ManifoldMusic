@@ -298,57 +298,49 @@ def save_audio(tensor, filename, sample_rate=22050):
 
 def geodesic_imputation(model, params, sequence_with_gap, gap_start, gap_end, key, epsilon=1e-7):
     """
-    Imputes a gap using the learned Manifold ODE dynamics (Autoregressive Rollout).
-    This follows the 'geodesic' flow of the dynamical system, preserving phase and frequency.
+    Imputes a gap using the learned ManifoldFormer (full forward pass).
+    Uses autoregressive prediction: encode → dynamics → decode → feed back as input.
     """
     original_seq_len = sequence_with_gap.shape[0]
+    channels = sequence_with_gap.shape[1]
 
-    # 1. Encode the full sequence to get the context before the gap
-    # We need to pass a key for the VAE
-    _, z_full_latent, _, _ = model.apply({'params': params}, sequence_with_gap, key, method=lambda module, x, rng: module.vae(x, rng))
+    # Start with valid history up to the gap (noisy input)
+    # We'll autoregressively predict and build the sequence
+    current_seq = sequence_with_gap[:gap_start].copy()
     
-    # We start with the valid history up to the gap
-    # Shape: (1, T, D) - adding batch dim for the model
-    current_z_seq = z_full_latent[:gap_start][None, ...] 
-    
-    # We need to generate up to the end of the shadow region (to fix the encoder corruption)
-    # The encoder receptive field is ~16.
+    # Extend to gap region plus receptive field shadow
     receptive_field = 16
     fill_end = min(gap_end + receptive_field, original_seq_len)
     steps_to_generate = fill_end - gap_start
     
-    print(f"Autoregressively generating {steps_to_generate} steps using learned dynamics...")
+    print(f"Autoregressively generating {steps_to_generate} steps using full model forward pass...")
     
-    # JIT compile the single-step prediction for speed
+    # JIT compile the single-step prediction
     @jax.jit
-    def predict_step(seq, params):
-        z_dyn_seq = model.apply({'params': params}, seq, method=lambda m, x: m.dynamics(x))
-        return z_dyn_seq[:, -1:, :]
-
-    for _ in range(steps_to_generate):
-        # Predict the next state from the current history
-        # The Dynamics module returns the evolved state for each step.
-        # We want the evolution of the LAST step in the current sequence.
-        next_z = predict_step(current_z_seq, params)
+    def predict_next(input_seq, rng, params):
+        # Full forward pass: input → VAE → Dynamics → Decode
+        # Returns the prediction for the NEXT step
+        input_batch = input_seq[None, ...]  # Add batch dim: (1, T, C)
+        pred, _, _, _, _, _, _ = model.apply({'params': params}, input_batch, rng)
+        # pred shape: (1, T, C) - predictions for next steps
+        return pred[0, -1, :]  # Return last prediction: (C,)
+    
+    for i in range(steps_to_generate):
+        # Generate next frame from current sequence
+        key, subkey = jrandom.split(key)
+        next_frame = predict_next(current_seq, subkey, params)
         
-        # Enforce manifold constraint (just in case, though dynamics should do it)
-        norm = jnp.linalg.norm(next_z, axis=-1, keepdims=True)
-        next_z = next_z / jnp.maximum(norm, epsilon)
-        
-        # Append to history
-        current_z_seq = jnp.concatenate([current_z_seq, next_z], axis=1)
-        
-    # Extract the generated segment (excluding the history we started with)
+        # Append to sequence
+        current_seq = jnp.concatenate([current_seq, next_frame[None, :]], axis=0)
+    
     # The generated part starts at index gap_start
-    generated_segment = current_z_seq[0, gap_start:]
+    # Extract and splice back into the full sequence
+    generated_segment = current_seq[gap_start:]
     
-    # Splice it back into the full latent sequence
-    # We replace from gap_start to fill_end
-    z_imputed_full = z_full_latent.at[gap_start:fill_end].set(generated_segment)
+    # Replace the gap region
+    imputed_full = sequence_with_gap.at[gap_start:fill_end].set(generated_segment)
     
-    # Decode the imputed sequence.
-    imputed_output = model.apply({'params': params}, z_imputed_full, method=lambda module, x: module.vae.decode(x))
-    return imputed_output
+    return imputed_full
 
 # --- Visualization ---
 
