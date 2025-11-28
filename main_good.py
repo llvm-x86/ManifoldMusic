@@ -393,7 +393,7 @@ def main():
     
     seq_len = 256
     channels = 16
-    latent_dim = 21
+    latent_dim = 32
     num_epochs = 20
     batch_size = 64
     
@@ -417,7 +417,6 @@ def main():
     optimizer = optax.adamw(1e-3)
     state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
     
-    print("Starting training (JIT compilation will occur on first batch, this may take 30-60s)...")
     for epoch in range(num_epochs):
         total_loss = 0
         for i in range(len(synth_ds)):
