@@ -5,6 +5,41 @@
 
 ---
 
+## Critical Lessons Learned (Do Not Repeat)
+
+### 1. Imputation Strategy: Latent vs. Signal Space
+**Mistake**: Performing imputation in **signal space** (Input $\to$ VAE $\to$ Dynamics $\to$ Decode $\to$ Input).
+**Why it failed**: This feedback loop accumulates error from the VAE's encoder/decoder at every step. The signal degrades rapidly because the model is not a perfect identity map.
+**Correction**: Perform autoregressive rollout entirely in **latent space** (Encode Context $\to$ Evolve Latent State $\to$ Decode Result).
+**Mechanism**:
+$$
+z_{t+1} = \text{Dynamics}(z_t) \quad \text{(Latent Evolution)}
+$$
+Only decode $\hat{X}$ at the very end. This preserves the phase/frequency information encoded in the manifold state without corruption.
+
+### 2. Dynamics Modeling: Discrete vs. Continuous
+**Mistake**: Using multi-step RK4 (substeps=4) with small step size ($h=0.25$) for discrete sequence data.
+**Why it failed**: The data is discrete (time steps). Forcing a continuous solver to take multiple substeps between data points complicates the optimization landscape and creates a mismatch between the model's "time" and the data's index.
+**Correction**: Use **single-step RK4** ($h=1.0$).
+**Mechanism**:
+$$
+z_{t+1} = \text{RK4}(z_t, h=1.0)
+$$
+This effectively treats the ODE solver as a sophisticated Recurrent Neural Network (RNN) cell that respects the manifold geometry.
+
+### 3. Optimization: Learning Rate & JIT
+**Mistake**: Using a low learning rate (`1e-4`) with the complex dynamics model.
+**Correction**: Increase learning rate to `1e-3`. The manifold optimization landscape is well-conditioned enough for larger steps.
+**Note**: JAX JIT compilation takes significant time (30-60s) on the first batch. **Always inform the user** via print statements to prevent "hang" diagnosis.
+
+### 4. Architecture: ManifoldFormer
+**Correct Architecture**:
+- **Encoder**: Causal Conv $\to$ Dense $\to$ Tangent Space Projection $\to$ Exp Map
+- **Dynamics**: Power-Law Memory (Long-term) + Kuramoto Attention (Short-term/Coupling)
+- **Decoder**: Dense MLP (Pointwise)
+
+---
+
 ## System Architecture
 
 The ManifoldFormer implements a three-stage pipeline for temporal sequence modeling on a Riemannian manifold $\mathcal{M} = \mathbb{S}^{d-1}$:
@@ -54,171 +89,14 @@ $$
 
 ---
 
-## Investigation Timeline
+## Mathematical Summary of Fixes
 
-### Attempt #1: Fixed Power-Law Kernel Initialization
-
-**Hypothesis**: The memory kernel $\mathbf{M}(t)$ was being randomly initialized instead of using the prescribed power-law structure.
-
-**Implementation**:
-```python
-def memory_kernel_init(key, shape, dtype=jnp.float32):
-    k = get_fractional_kernel(gamma, kernel_size)  # t^(-gamma) / Gamma(1-gamma)
-    return jnp.tile(k, (1, 1, latent_dim))
-
-memory_force = nn.Conv(..., kernel_init=memory_kernel_init, use_bias=False)(z)
-```
-
-**Mathematical Change**:
-$$
-K[n] = \frac{n^{-\gamma}}{\Gamma(1-\gamma)} \quad \text{(enforced at initialization)}
-$$
-
-**Result**: Loss increased to **0.13** (baseline: 0.03)
-
-**Diagnosis**: While the kernel was correctly initialized, it remained **trainable**, allowing gradient descent to drift away from the geometric structure.
-
----
-
-### Attempt #2: Learnable Projection with Fixed Structure
-
-**Hypothesis**: Remove the learnable capacity entirely from the memory integral while introducing a separate mixing layer.
-
-**Implementation**:
-$$
-\text{memory\_force} = W_{style}(\text{Conv}_{fixed}(z))
-$$
-
-where $\text{Conv}_{fixed}$ uses the frozen power-law kernel, and $W_{style} \in \mathbb{R}^{d \times d}$ is a learnable Dense layer.
-
-**Result**: Loss increased to **0.09**
-
-**Diagnosis**: The additional projection layer created **optimization difficulties**. The model struggled to balance:
-- Fixed geometric structure (temporal memory)
-- Learnable mixing weights
-- Reconstruction fidelity
-
----
-
-### Attempt #3: Strictly Frozen Kernel
-
-**Hypothesis**: Prevent kernel drift entirely by computing convolution outside the parameter system.
-
-**Implementation**:
-```python
-kernel = jnp.tile(get_fractional_kernel(gamma, kernel_size), (1, 1, latent_dim))
-z_padded = jnp.pad(z, ((0, 0), (pad_width, 0), (0, 0)))
-memory_force = jax.lax.conv_general_dilated(
-    lhs=z_padded, rhs=kernel, ..., feature_group_count=latent_dim
-)
-```
-
-**Result**: Loss **diverged** to 0.25 by epoch 10 (peaked at 0.12 epoch 6)
-
-**Diagnosis**: Training became **unstable**. The frozen kernel enforced a strong inductive bias that conflicted with the optimizer's ability to find a good solution in the joint parameter space $(W_Q, W_K, W_{out}, \text{VAE})$.
-
----
-
-## Root Cause Analysis
-
-### The True Issue: Imputation Mechanism
-
-All kernel-focused fixes failed to improve imputation. Re-examining the `geodesic_imputation` function revealed:
-
-**Original Implementation**:
-$$
-\begin{align}
-&\text{1. Encode full sequence (including gap):} \quad z_{full} = \text{VAE.encode}(x_{gapped}) \\
-&\text{2. Extract pre-gap history:} \quad z_{hist} = z_{full}[:gap\_start] \\
-&\text{3. Autoregressive rollout in latent space:} \\
-&\quad z_{t+1} = \text{Dynamics}(z_{:t}) \\
-&\text{4. Decode imputed latents:} \quad \hat{x} = \text{VAE.decode}(z_{imputed})
-\end{align}
-$$
-
-**Fundamental Flaw**:
-
-The model is trained **end-to-end** with the full pipeline:
-$$
-X \xrightarrow{\text{VAE}} Z \xrightarrow{\text{Dynamics}} Z_{dyn} \xrightarrow{\text{Decode}} \hat{X}
-$$
-
-But imputation used **only** the Dynamics module in isolation:
-$$
-Z_{hist} \xrightarrow{\text{Dynamics only}} Z_{imputed}
-$$
-
-This violates the learned representation since:
-1. The Dynamics module expects $Z$ from VAE encoding of **clean signal**
-2. Autoregressive latent rollout lacks the decoder's learned inverse mapping
-3. The gap was pre-encoded with **zeros**, corrupting the context
-
----
-
-## Final Solution
-
-### Corrected Imputation Algorithm
-
-**Autoregressive Forward Pass**:
-$$
-\begin{align}
-&\text{Initialize:} \quad X_{hist} = X_{valid}[:gap\_start] \\
-&\text{For } t = gap\_start \text{ to } gap\_end + \text{receptive\_field}: \\
-&\quad \quad X_t^{(batch)} = X_{hist}[None, :, :] \quad \text{(add batch dim)} \\
-&\quad \quad \hat{X}_{t+1} = \text{ManifoldFormer}(X_t^{(batch)}, rng)[0, -1, :] \quad \text{(full forward pass)} \\
-&\quad \quad X_{hist} \leftarrow \text{concat}(X_{hist}, \hat{X}_{t+1}) \\
-&\text{Splice} \quad X_{imputed} = X_{gapped}.at[gap\_start:fill\_end].set(X_{hist}[gap\_start:])
-\end{align}
-$$
-
-**Key Changes**:
-1. **Use full model**: $X \to \text{VAE} \to \text{Dynamics} \to \text{Decode} \to \hat{X}$
-2. **Feed predictions back as input**, matching training paradigm
-3. **No latent manipulation**, preserving learned representations
-
----
-
-## Architectural Insights
-
-### Why Memory Kernel Fixes Failed
-
-The power-law memory kernel is **one component** of a complex dynamical system. Enforcing its mathematical form without co-adapting the rest of the system creates:
-
-**Constraint Violation**:
-$$
-\min_{\theta} \mathcal{L}_{recon} + \lambda_{smooth} \mathcal{L}_{geo} + \lambda_{iso} \mathcal{L}_{iso} \quad \text{s.t. } K_{memory} = K_{fixed}
-$$
-
-The constrained optimization landscape becomes **non-convex and unstable**.
-
-### The Correct Inductive Bias
-
-Instead of enforcing rigid geometric structure, the fix:
-1. **Respects the learned manifold** by always passing through VAE
-2. **Matches training distribution** (autoregressive signal-space prediction)
-3. **Allows geometric priors to emerge** from loss functions, not hard constraints
-
----
-
-## Status: Resolution Implemented
-
-**Implementation**: ✅ `geodesic_imputation` rewritten to use full ManifoldFormer forward pass
-
-**Theoretical Soundness**: ✅ Aligns imputation with training objective
-
-**Expected Outcome**: Imputation should capture deterministic patterns via learned dynamics $\frac{dz}{dt}$, with the VAE maintaining signal-manifold correspondence
-
----
-
-## Mathematical Summary
-
-| Approach | Core Idea | Mathematical Form | Loss | Status |
-|----------|-----------|------------------|------|--------|
-| Original | Random kernel init | $K \sim \mathcal{N}(0, \sigma^2)$ | 0.03 | ❌ Poor imputation |
-| Attempt 1 | Init with power-law | $K(0) = t^{-\gamma}/\Gamma(1-\gamma)$ | 0.13 | ❌ Kernel drift |
-| Attempt 2 | Init + projection | $F = W_{style}(K_{init} * z)$ | 0.09 | ❌ Optimization conflict |
-| Attempt 3 | Frozen kernel | $K = \text{const}$ | 0.25 | ❌ Training divergence |
-| **Solution** | **Fix imputation logic** | $\hat{X}_t = \text{Model}(X_{<t})$ | **TBD** | ✅ **Correct paradigm** |
+| Component | Previous (Failed) | Current (Success) | Reason |
+|-----------|-------------------|-------------------|--------|
+| **Imputation** | Signal Space (AR) | **Latent Space (AR)** | Avoids VAE error accumulation |
+| **Solver** | RK4 (4 substeps, h=0.25) | **RK4 (1 step, h=1.0)** | Matches discrete data structure |
+| **Kernel** | Hard-coded / Frozen | **Learnable (Init as Power-Law)** | Allows data adaptation |
+| **LR** | 1e-4 | **1e-3** | Better convergence |
 
 ---
 

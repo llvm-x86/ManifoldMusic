@@ -92,13 +92,16 @@ class Dynamics(nn.Module):
         # we assume the 'Keys' and 'Values' are fixed by the input trajectory,
         # and only the 'Query' (the particle being evolved) changes during the RK4 substeps.
         
-        k_proj_layer = nn.Dense(self.latent_dim, name="K_proj")
-        q_proj_layer = nn.Dense(self.latent_dim, name="Q_proj")
+        # "Pick a lock with your own key" -> Use intrinsic geometry (Key = Self)
+        # Remove projections to match the sphere geometry directly.
+        # k_proj_layer = nn.Dense(self.latent_dim, name="K_proj")
+        # q_proj_layer = nn.Dense(self.latent_dim, name="Q_proj")
         out_proj_layer = nn.Dense(self.latent_dim, name="Out_proj")
 
-        k = k_proj_layer(z)
-        k_hat = k / jnp.maximum(jnp.linalg.norm(k, axis=-1, keepdims=True), 1e-8)
-        
+        # k = k_proj_layer(z)
+        # k_hat = k / jnp.maximum(jnp.linalg.norm(k, axis=-1, keepdims=True), 1e-8)
+        k_hat = z # z is already on manifold
+
         # Causal Mask for Attention
         # mask[i, j] = 1 if i >= j else 0
         mask = jnp.tril(jnp.ones((T, T)))
@@ -108,8 +111,9 @@ class Dynamics(nn.Module):
         # z_curr: (B, T, D) - The current estimate of the state at each time step
         def vector_field(z_curr):
             # Project z_curr to Query
-            q = q_proj_layer(z_curr)
-            q_hat = q / jnp.maximum(jnp.linalg.norm(q, axis=-1, keepdims=True), 1e-8)
+            # q = q_proj_layer(z_curr)
+            # q_hat = q / jnp.maximum(jnp.linalg.norm(q, axis=-1, keepdims=True), 1e-8)
+            q_hat = z_curr # Intrinsic query
             
             # Causal Attention: Query (Current) vs Keys (History/Context)
             dots = jnp.einsum('btd,bTd->btT', q_hat, k_hat)
@@ -212,7 +216,8 @@ def loss_fn(params, state, x, y_pred_target, y_recon_target, rng):
     # Then KL is standard Gaussian KL on the tangent coefficients.
     l_kl = -0.5 * jnp.mean(1 + jnp.log(sigma ** 2) - sigma ** 2)
     
-    return l_recon + l_recon_vae + 0.1 * l_smooth + 0.01 * l_iso + 0.001 * l_kl
+    # Remove KL to allow deterministic manifold learning (Data is deterministic)
+    return l_recon + l_recon_vae + 0.1 * l_smooth + 0.01 * l_iso + 0.0 * l_kl
 
 # --- Data Generation ---
 
@@ -236,6 +241,9 @@ class SyntheticChordsDataset:
         
         clean_signals = []
         noisy_signals = []
+        
+        # Make data deterministic per index to allow "grokking"
+        np.random.seed(idx)
         
         for _ in range(self.batch_size):
             freqs = np.random.choice([1, 2, 3, 5, 8], size=3, replace=False)
@@ -393,8 +401,8 @@ def main():
     
     seq_len = 256
     channels = 16
-    latent_dim = 32
-    num_epochs = 20
+    latent_dim = 21
+    num_epochs = 3
     batch_size = 64
     
     model = ManifoldFormer(input_dim=channels, latent_dim=latent_dim)
@@ -417,6 +425,7 @@ def main():
     optimizer = optax.adamw(1e-3)
     state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
     
+    print("Starting training (JIT compilation will occur on first batch, this may take 30-60s)...")
     for epoch in range(num_epochs):
         total_loss = 0
         for i in range(len(synth_ds)):
