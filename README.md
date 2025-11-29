@@ -226,6 +226,8 @@ Since the loss function sums prediction error and reconstruction error, the tota
 
 ### Running Training
 
+To run the training script, ensure you have your environment set up with `uv`.
+
 ```bash
 uv run python -m main
 ```
@@ -316,15 +318,53 @@ In music, this models:
 ```
 music manifold/
 ├── main.py                    # Main implementation
+├── inputs/                    # Input image and audio files
+│   ├── imputation_demo.png    # Demonstration of imputation
+│   ├── isometry_check.png     # Isometry check visualization
+│   ├── phase_portrait.png     # Latent phase portrait visualization
+│   ├── sync_map.png           # Synchronization map visualization
+│   └── original_audio_sample.wav # Original audio sample
+├── outputs/                   # Output audio files
+│   └── imputed_audio_sample.wav # Imputed audio sample
+├── docs/                      # Documentation and OpenAI tool related files
+│   ├── temporal.md            # Formal mathematical specification
+│   ├── zyra_photon.md         # Zyra Photon related information (from another LLM)
+│   ├── beta.py                # Experimental Python code
+│   └── riemann_Information_Extraction_applications.md # GPT-5.1 recommendations
+├── internal/                  # Internal tools and status files
+│   ├── env_parser.py          # Custom .env file parser
+│   ├── openai_next_path_tool.py # Tool for GPT-5.1 recommendations
+│   └── STATUS.md              # Project status file
 ├── reference/
-│   └── temporal.md            # Formal mathematical specification
 ├── README.md                  # This file
 └── TODO.md                    # Development roadmap
 ```
 
 ---
 
-## 🎯 Applications
+### Running the OpenAI Next Path Tool
+
+This tool leverages GPT-5.1 to provide recommendations for the project's next steps based on various contextual files.
+
+**Setup:**
+1.  **OpenAI API Key**: Create a `.env` file in the root directory of the project and add your OpenAI API key:
+    ```
+    OPENAI_API_KEY=your_openai_api_key_here
+    ```
+2.  **Install Dependencies**: Ensure all project dependencies, including `requests` for API communication, are installed using `uv`:
+    ```bash
+    uv pip install -e .
+    ```
+
+**Execution:**
+Run the tool using `uv`:
+```bash
+uv run python internal/openai_next_path_tool.py
+```
+
+**Output:**
+The recommended next path will be printed to your console and also saved to `outputs/riemann_Information_Extraction_applications.md`. Note that this file will be overwritten with each run.
+
 
 This architecture is designed for:
 

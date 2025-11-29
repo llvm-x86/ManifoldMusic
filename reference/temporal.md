@@ -6,7 +6,7 @@ This document provides a consolidated, mathematically rigorous specification for
 
 ## 1. Global Geometric Assumption
 
-The system assumes latent dynamics evolve on a compact Riemannian manifold $\mathcal{M}$, specifically the unit Hypersphere $\mathbb{S}^{d-1}$ embedded in $\mathbb{R}^d$.
+The system assumes latent dynamics evolve on a compact Riemannian manifold $\mathcal{M}$, specifically the unit Hypersphere $\mathbb{S}^{d-1}$ embedded i   n $\mathbb{R}^d$.
 
 *   **Manifold Definition:** $\mathcal{M} = \{ z \in \mathbb{R}^d \mid \|z\|_2 = 1 \}$
 *   **Tangent Space ($T_\mu\mathcal{M}$):** The vector space tangent to $\mathcal{M}$ at point $\mu$. For the sphere, $T_\mu\mathcal{M} = \{ v \in \mathbb{R}^d \mid \langle \mu, v \rangle = 0 \}$.

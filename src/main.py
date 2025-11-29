@@ -92,20 +92,13 @@ class Dynamics(nn.Module):
         # we assume the 'Keys' and 'Values' are fixed by the input trajectory,
         # and only the 'Query' (the particle being evolved) changes during the RK4 substeps.
         
-        # "Pick a lock with your own key" -> Use intrinsic geometry (Key = Self)
-        # Remove projections to match the sphere geometry directly.
-        # k_proj_layer = nn.Dense(self.latent_dim, name="K_proj")
-        # q_proj_layer = nn.Dense(self.latent_dim, name="Q_proj")
+        k_proj_layer = nn.Dense(self.latent_dim, name="K_proj")
+        q_proj_layer = nn.Dense(self.latent_dim, name="Q_proj")
         out_proj_layer = nn.Dense(self.latent_dim, name="Out_proj")
+
+        k = k_proj_layer(z)
+        k_hat = k / jnp.maximum(jnp.linalg.norm(k, axis=-1, keepdims=True), 1e-8)
         
-        # Sakaguchi-Kuramoto Phase Lag
-        # A learnable phase shift that prevents amplitude death and promotes limit cycles.
-        phase_lag = self.param('phase_lag', nn.initializers.zeros, (1,))
-
-        # k = k_proj_layer(z)
-        # k_hat = k / jnp.maximum(jnp.linalg.norm(k, axis=-1, keepdims=True), 1e-8)
-        k_hat = z # z is already on manifold
-
         # Causal Mask for Attention
         # mask[i, j] = 1 if i >= j else 0
         mask = jnp.tril(jnp.ones((T, T)))
@@ -115,9 +108,8 @@ class Dynamics(nn.Module):
         # z_curr: (B, T, D) - The current estimate of the state at each time step
         def vector_field(z_curr):
             # Project z_curr to Query
-            # q = q_proj_layer(z_curr)
-            # q_hat = q / jnp.maximum(jnp.linalg.norm(q, axis=-1, keepdims=True), 1e-8)
-            q_hat = z_curr # Intrinsic query
+            q = q_proj_layer(z_curr)
+            q_hat = q / jnp.maximum(jnp.linalg.norm(q, axis=-1, keepdims=True), 1e-8)
             
             # Causal Attention: Query (Current) vs Keys (History/Context)
             dots = jnp.einsum('btd,bTd->btT', q_hat, k_hat)
@@ -125,8 +117,7 @@ class Dynamics(nn.Module):
             # Apply Mask: Set future positions to -inf before softmax? 
             # But this is Kuramoto (sin), not Softmax. 
             # We just zero out the contributions from the future.
-            # Sakaguchi-Kuramoto: sin(theta_j - theta_i + alpha)
-            attn_weights = jnp.sin(dots + phase_lag) * mask
+            attn_weights = jnp.sin(dots) * mask
             
             # Compute Force
             kuramoto_force_raw = jnp.einsum('btT,bTd->btd', attn_weights, k_hat)
@@ -177,17 +168,12 @@ class ManifoldFormer(nn.Module):
 
     def setup(self):
         self.vae = VAE(self.input_dim, self.latent_dim)
-        self.align = DynamicCayleyRotation(self.latent_dim)
         self.dynamics = Dynamics(self.latent_dim)
         self.iso_scale = self.param('iso_scale', nn.initializers.ones, (1,))
 
     def __call__(self, x, rng):
         recon_vae, z, mu, sigma = self.vae(x, rng)
-        
-        # Align Encoder output to Dynamics canonical frame
-        z_aligned = self.align(z)
-        
-        z_dyn = self.dynamics(z_aligned)
+        z_dyn = self.dynamics(z)
         
         # Decode the dynamic state
         out = self.vae.decode(z_dyn)
@@ -196,118 +182,11 @@ class ManifoldFormer(nn.Module):
 
 # --- Loss Function ---
 
-# --- Loss Function ---
-
-# --- Loss Function ---
-
-def fractional_fidelity_loss(pred, target, gammas, kernel_size=128):
-    """
-    Computes fidelity loss by convolving with a bank of fractional kernels.
-    This measures alignment across different 'temporal horizons' defined by gamma.
-    Uses Log-Magnitude Spectral Loss to prevent energy squashing.
-    """
-    loss = 0.0
-    B, T, C = pred.shape
-    
-    for gamma in gammas:
-        raw_kernel = get_fractional_kernel(gamma, kernel_size) # (K, 1, 1)
-        
-        # FFT convolution
-        fft_len = T + kernel_size - 1
-        
-        # Pad kernel
-        kernel_padded = jnp.pad(raw_kernel.squeeze(), (0, fft_len - kernel_size))
-        kernel_fft = jnp.fft.rfft(kernel_padded)
-        
-        # Pad signals
-        pred_T = pred.transpose(0, 2, 1) # (B, C, T)
-        target_T = target.transpose(0, 2, 1)
-        
-        pred_padded = jnp.pad(pred_T, ((0,0), (0,0), (0, kernel_size - 1)))
-        target_padded = jnp.pad(target_T, ((0,0), (0,0), (0, kernel_size - 1)))
-        
-        pred_fft = jnp.fft.rfft(pred_padded, axis=-1)
-        target_fft = jnp.fft.rfft(target_padded, axis=-1)
-        
-        # Convolve in freq domain
-        pred_conv_fft = pred_fft * kernel_fft[None, None, :]
-        target_conv_fft = target_fft * kernel_fft[None, None, :]
-        
-        # Log-Magnitude Spectral Loss
-        # L = || log(|F(y)|) - log(|F(hat_y)|) ||
-        # Add epsilon to prevent log(0)
-        eps = 1e-8
-        log_mag_pred = jnp.log(jnp.abs(pred_conv_fft) + eps)
-        log_mag_target = jnp.log(jnp.abs(target_conv_fft) + eps)
-        
-        l_gamma = jnp.mean(jnp.abs(log_mag_pred - log_mag_target))
-        
-        loss += l_gamma
-        
-    return loss / len(gammas)
-
-class DynamicCayleyRotation(nn.Module):
-    latent_dim: int
-
-    @nn.compact
-    def __call__(self, x):
-        # x can be (Batch, Time, LatentDim) or (Time, LatentDim)
-        # Normalize to batched format
-        original_shape = x.shape
-        if x.ndim == 2:
-            # Unbatched: (Time, LatentDim) -> (1, Time, LatentDim)
-            x = x[None, ...]
-            was_unbatched = True
-        else:
-            was_unbatched = False
-        
-        # Now x is always (Batch, Time, LatentDim)
-        
-        # 1. Context Extraction (Global Pooling)
-        # We want a rotation that is specific to the *trajectory* resonance.
-        # Mean pooling over time to get the "fundamental" state of the sequence
-        context = jnp.mean(x, axis=1) # (Batch, LatentDim)
-        
-        # 2. Predict Skew-Symmetric Matrix A
-        # Embed context
-        hidden = nn.Dense(128)(context)
-        hidden = nn.relu(hidden)
-        
-        # Predict W (Batch, D, D)
-        W_flat = nn.Dense(self.latent_dim * self.latent_dim)(hidden)
-        W = W_flat.reshape(-1, self.latent_dim, self.latent_dim)
-        
-        # Enforce Skew-Symmetry: A = W - W.T
-        A = W - jnp.transpose(W, (0, 2, 1))
-        
-        # 3. Cayley Transform: R = (I - A)(I + A)^-1
-        I = jnp.eye(self.latent_dim)[None, :, :] # Broadcast identity
-        
-        numerator = I - A
-        denominator = I + A
-        
-        # Batched Matrix Inversion
-        inv_denominator = jnp.linalg.inv(denominator)
-        R = jnp.matmul(numerator, inv_denominator) # (Batch, D, D)
-        
-        # 4. Apply Rotation
-        # x: (Batch, Time, D) @ R: (Batch, D, D) -> (Batch, Time, D)
-        result = jnp.einsum('btd,bde->bte', x, R)
-        
-        # Return to original shape
-        if was_unbatched:
-            result = result[0]  # Remove batch dimension
-        
-        return result
-
-
-def loss_fn(params, state, x, y_pred_target, y_recon_target, rng, return_mse=False):
+def loss_fn(params, state, x, y_pred_target, y_recon_target, rng):
     pred, recon_vae, z, z_dyn, iso_scale, mu, sigma = state.apply_fn({'params': params}, x, rng)
     
-    # Track MSE for reference (not used in backprop)
     l_recon = jnp.mean((pred - y_pred_target) ** 2)
     l_recon_vae = jnp.mean((recon_vae - y_recon_target) ** 2)
-    mse_loss = l_recon + l_recon_vae
     
     # Geodesic smoothness on the sphere
     dot_product = jnp.sum(z_dyn * z, axis=-1).clip(-1.0 + 1e-6, 1.0 - 1e-6)
@@ -315,111 +194,34 @@ def loss_fn(params, state, x, y_pred_target, y_recon_target, rng, return_mse=Fal
     l_smooth = jnp.mean(geodesic_dist ** 2)
     
     # Scaled Isometry Loss
+    # Input distances (Euclidean)
     dist_x = jnp.sqrt(jnp.sum((x[:, :, None, :] - x[:, None, :, :]) ** 2, axis=-1) + 1e-8)
+    
+    # Latent distances (Geodesic)
     dot_z = jnp.einsum('btd,bTd->btT', z, z).clip(-1.0 + 1e-6, 1.0 - 1e-6)
     dist_z = jnp.arccos(dot_z)
+    
     l_iso = jnp.mean((iso_scale * dist_z - dist_x) ** 2)
     
-    # KL Divergence
+    # KL Divergence for Riemannian Normal (Approximate)
+    # KL(N_M(mu, sigma) || U_M) ~ -Entropy
+    # For small sigma, it behaves like Euclidean KL on tangent space.
+    # KL ~ -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2) ? No, prior is Uniform on Sphere?
+    # Or prior is Standard Normal on Tangent Space?
+    # Let's assume prior is N(0, I) on tangent space (wrapped).
+    # Then KL is standard Gaussian KL on the tangent coefficients.
     l_kl = -0.5 * jnp.mean(1 + jnp.log(sigma ** 2) - sigma ** 2)
     
-    # --- Fractional Fidelity Loss ---
-    # "Use the temporal components to better model the fidelity"
-    gammas = [0.1, 0.3, 0.5, 0.7, 0.9]
-    l_frac = fractional_fidelity_loss(pred, y_pred_target, gammas, kernel_size=128)
-    
-    # Latent Resonant Entropy (Updated to Magnitude-based)
-    # Reference: p_i = |w_i| / sum(|w_j|)
-    z_fft = jnp.fft.rfft(z_dyn, axis=1)
-    z_mag = jnp.abs(z_fft) # Magnitude, not Power
-    z_prob = z_mag / (jnp.sum(z_mag, axis=1, keepdims=True) + 1e-8)
-    l_entropy = -jnp.mean(jnp.sum(z_prob * jnp.log(z_prob + 1e-8), axis=1))
-    
-    # Base loss (geometric terms only, for tracking)
-    base_loss = 0.1 * l_smooth + 0.01 * l_iso
-    
-    # ONLY backpropagate fractional terms + Entropy
-    spectral_loss = 1.0 * l_frac + 0.05 * l_entropy # Increased entropy weight slightly
-    
-    if return_mse:
-        return spectral_loss, mse_loss, base_loss
-    return spectral_loss
-
-# --- Oracle & Validation ---
-
-def compute_oracle_trajectory(seq_len, freqs, phase_shifts, latent_dim):
-    """
-    Computes the 'Perfect' latent trajectory based on the ground truth oscillators.
-    Embeds the analytic signal (sin, cos) of each frequency onto the hypersphere.
-    """
-    t = np.linspace(0, 4 * np.pi, seq_len)
-    
-    # We construct a high-dimensional state from the oscillators
-    # For each freq, we have sin and cos components (Analytic Signal)
-    components = []
-    for f in freqs:
-        # We average the phase shifts across channels to get the "fundamental" phase for this freq
-        # Or better, we just take the base phase. 
-        # In the dataset, phase_shift depends on channel. 
-        # The latent space should capture the "global" dynamics.
-        # Let's assume the latent space captures the fundamental oscillators.
-        components.append(np.sin(f * t))
-        components.append(np.cos(f * t))
-        
-    # Stack components
-    oracle_raw = np.stack(components, axis=-1) # (T, 2*Num_Freqs)
-    
-    # Pad or project to latent_dim
-    T, D_raw = oracle_raw.shape
-    if D_raw < latent_dim:
-        # Pad with noise or zeros? Zeros is safer for "perfect" geometry.
-        padding = np.zeros((T, latent_dim - D_raw))
-        oracle_raw = np.concatenate([oracle_raw, padding], axis=-1)
-    elif D_raw > latent_dim:
-        # PCA projection? Or just truncate?
-        oracle_raw = oracle_raw[:, :latent_dim]
-        
-    # Normalize to Sphere (The Manifold Constraint)
-    norm = np.linalg.norm(oracle_raw, axis=-1, keepdims=True)
-    oracle_z = oracle_raw / (norm + 1e-8)
-    
-    return oracle_z
-
-def procrustes_distance(z_learned, z_oracle):
-    """
-    Computes the Procrustes distance between learned and oracle trajectories.
-    Finds optimal rotation R to minimize ||z_learned - z_oracle @ R||.
-    Returns the RMSE after alignment.
-    """
-    # z_learned: (T, D)
-    # z_oracle: (T, D)
-    
-    # Center data (though they are on sphere, centering helps align "clouds")
-    z_learned_c = z_learned - np.mean(z_learned, axis=0)
-    z_oracle_c = z_oracle - np.mean(z_oracle, axis=0)
-    
-    # SVD for optimal rotation
-    # M = A.T @ B
-    M = z_learned_c.T @ z_oracle_c
-    U, _, Vt = np.linalg.svd(M)
-    R = U @ Vt
-    
-    # Align
-    z_aligned = z_learned_c @ R
-    
-    # RMSE
-    mse = np.mean((z_aligned - z_oracle_c) ** 2)
-    return np.sqrt(mse)
+    return l_recon + l_recon_vae + 0.1 * l_smooth + 0.01 * l_iso + 0.001 * l_kl
 
 # --- Data Generation ---
 
 class SyntheticChordsDataset:
-    def __init__(self, num_samples=1000, seq_len=128, channels=64, batch_size=16, latent_dim=21):
+    def __init__(self, num_samples=1000, seq_len=128, channels=64, batch_size=16):
         self.num_samples = num_samples
         self.seq_len = seq_len
         self.channels = channels
         self.batch_size = batch_size
-        self.latent_dim = latent_dim
         
     def __len__(self):
         return self.num_samples // self.batch_size
@@ -427,22 +229,18 @@ class SyntheticChordsDataset:
     def __getitem__(self, idx):
         t = np.linspace(0, 4 * np.pi, self.seq_len)
         
+
+        # Return (Noisy Input, Clean Target)
+        # We need to generate the clean version again or store it.
+        # Let's refactor to generate clean first, then add noise.
+        
         clean_signals = []
         noisy_signals = []
-        oracle_trajectories = []
-        
-        # Make data deterministic per index to allow "grokking"
-        np.random.seed(idx)
         
         for _ in range(self.batch_size):
             freqs = np.random.choice([1, 2, 3, 5, 8], size=3, replace=False)
             clean_signal = np.zeros((self.seq_len, self.channels))
             noisy_signal = np.zeros((self.seq_len, self.channels))
-            
-            # Generate Oracle for this sample
-            # We use the freqs selected.
-            oracle_z = compute_oracle_trajectory(self.seq_len, freqs, None, self.latent_dim)
-            oracle_trajectories.append(oracle_z)
             
             for ch in range(self.channels):
                 phase_shift = (ch / self.channels) * 2 * np.pi
@@ -457,13 +255,15 @@ class SyntheticChordsDataset:
             
         clean_signals = np.array(clean_signals)
         noisy_signals = np.array(noisy_signals)
-        oracle_trajectories = np.array(oracle_trajectories)
         
         # Input: Noisy [0:-1]
-        # Target: Clean [1:]
-        # Oracle: [0:-1] (aligned with input state)
+        # Target: Clean [1:] (for prediction) and Clean [0:-1] (for reconstruction)
+        # Actually, let's keep it simple:
+        # x = Noisy [0:-1]
+        # y_pred_target = Clean [1:]
+        # y_recon_target = Clean [0:-1]
         
-        return noisy_signals[:, :-1, :], clean_signals[:, 1:, :], clean_signals[:, :-1, :], oracle_trajectories[:, :-1, :]
+        return noisy_signals[:, :-1, :], clean_signals[:, 1:, :], clean_signals[:, :-1, :]
 
 # --- Audio Saving ---
 
@@ -503,12 +303,9 @@ def geodesic_imputation(model, params, sequence_with_gap, gap_start, gap_end, ke
     # We need to pass a key for the VAE
     _, z_full_latent, _, _ = model.apply({'params': params}, sequence_with_gap, key, method=lambda module, x, rng: module.vae(x, rng))
     
-    # 2. Align the latent state to the canonical dynamics frame
-    z_full_aligned = model.apply({'params': params}, z_full_latent, method=lambda m, x: m.align(x))
-    
-    # We start with the valid history up to the gap (aligned)
+    # We start with the valid history up to the gap
     # Shape: (1, T, D) - adding batch dim for the model
-    current_z_seq = z_full_aligned[:gap_start][None, ...] 
+    current_z_seq = z_full_latent[:gap_start][None, ...] 
     
     # We need to generate up to the end of the shadow region (to fix the encoder corruption)
     # The encoder receptive field is ~16.
@@ -543,7 +340,7 @@ def geodesic_imputation(model, params, sequence_with_gap, gap_start, gap_end, ke
     
     # Splice it back into the full latent sequence
     # We replace from gap_start to fill_end
-    z_imputed_full = z_full_aligned.at[gap_start:fill_end].set(generated_segment)
+    z_imputed_full = z_full_latent.at[gap_start:fill_end].set(generated_segment)
     
     # Decode the imputed sequence.
     imputed_output = model.apply({'params': params}, z_imputed_full, method=lambda module, x: module.vae.decode(x))
@@ -597,12 +394,12 @@ def main():
     seq_len = 256
     channels = 16
     latent_dim = 21
-    num_epochs = 3
+    num_epochs = 20
     batch_size = 64
     
     model = ManifoldFormer(input_dim=channels, latent_dim=latent_dim)
     
-    synth_ds = SyntheticChordsDataset(num_samples=10 * batch_size, seq_len=seq_len, channels=channels, batch_size=batch_size, latent_dim=latent_dim)
+    synth_ds = SyntheticChordsDataset(num_samples=10 * batch_size, seq_len=seq_len, channels=channels, batch_size=batch_size)
     
     @jax.jit
     def train_step(state, x, y_pred, y_recon, rng):
@@ -622,44 +419,27 @@ def main():
     
     print("Starting training (JIT compilation will occur on first batch, this may take 30-60s)...")
     for epoch in range(num_epochs):
-        total_spectral = 0
-        total_mse = 0
-        total_base = 0
-        total_oracle_dist = 0
-        
+        total_loss = 0
         for i in range(len(synth_ds)):
-            x, y_pred, y_recon, oracle_z = synth_ds[i]
+            x, y_pred, y_recon = synth_ds[i]
             state, train_rng = train_step(state, x, y_pred, y_recon, train_rng)
             
             # For logging, we need a key for loss_fn too if we call it outside
             train_rng, log_key = jrandom.split(train_rng)
-            spectral, mse, base = loss_fn(state.params, state, x, y_pred, y_recon, log_key, return_mse=True)
-            total_spectral += spectral
-            total_mse += mse
-            total_base += base
-            
-            # Compute Oracle Distance (Validation)
-            # Get current latent state
-            _, _, z, _, _, _, _ = state.apply_fn({'params': state.params}, x, log_key)
-            
-            # Compute Procrustes for the batch
-            # Average over batch
-            batch_dist = 0
-            for b in range(batch_size):
-                batch_dist += procrustes_distance(z[b], oracle_z[b])
-            total_oracle_dist += batch_dist / batch_size
-            
-        avg_spectral = total_spectral / len(synth_ds)
-        avg_mse = total_mse / len(synth_ds)
-        avg_base = total_base / len(synth_ds)
-        avg_oracle = total_oracle_dist / len(synth_ds)
-        
-        print(f"Epoch {epoch+1}/{num_epochs}, Spectral: {avg_spectral:.4f}, Oracle Dist: {avg_oracle:.4f}, MSE: {avg_mse:.4f}")
+            loss = loss_fn(state.params, state, x, y_pred, y_recon, log_key)
+            total_loss += loss
+        avg_loss = total_loss / len(synth_ds)
+        print(f"Epoch {epoch+1}/{num_epochs}, Avg Loss: {avg_loss:.4f}")
         
     print("\n--- Training Complete ---")
     
     # Reconstruct a full sequence for imputation demo
-    sample_x, sample_y_pred, sample_y_recon, _ = synth_ds[0]
+    sample_x, sample_y_pred, sample_y_recon = synth_ds[0]
+    # sample_x is (B, T-1, C)
+    # sample_y_pred is (B, T-1, C) (shifted by 1)
+    # We want to reconstruct the full sequence.
+    # Let's just use the first sample's full length from the dataset generation logic?
+    # Or just stitch x and the last of y.
     sample_input = jnp.concatenate([sample_x[0], sample_y_pred[0][-1][None, :]], axis=0)
 
     print("\n--- Demonstrating Geodesic Imputation ---")
@@ -669,11 +449,13 @@ def main():
     input_with_gap = np.copy(sample_input)
     input_with_gap[gap_start_idx:gap_end_idx, :] = 0.0
     
+    input_with_gap[gap_start_idx:gap_end_idx, :] = 0.0
+    
     # Pass a key for the VAE sampling in imputation
     impute_key, _ = jrandom.split(key)
     imputed_output = geodesic_imputation(model, state.params, input_with_gap, gap_start_idx, gap_end_idx, impute_key)
     
-    save_audio(imputed_output, "imputed_audio_sample.wav")
+    save_audio(imputed_output, "outputs/imputed_audio_sample.wav")
     
     plt.figure(figsize=(15, 6))
     time_steps = np.arange(seq_len)
@@ -690,7 +472,7 @@ def main():
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("imputation_demo.png")
+    plt.savefig("outputs/imputation_demo.png")
     plt.close()
     print("Saved 'imputation_demo.png'")
 
@@ -698,7 +480,7 @@ def main():
     # Get latent trajectory for the sample input
     # Use the mean (mu) for the phase portrait to show the "clean" manifold
     _, _, z_sample_mu, _ = model.apply({'params': state.params}, sample_input[None, ...], key, method=lambda m, x, rng: m.vae(x, rng))
-    plot_phase_portrait(z_sample_mu[0])
+    plot_phase_portrait(z_sample_mu[0], filename="outputs/phase_portrait.png")
 
 if __name__ == '__main__':
     main()
