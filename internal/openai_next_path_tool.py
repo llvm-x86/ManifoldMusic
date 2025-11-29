@@ -51,15 +51,21 @@ def get_openai_next_path_recommendation():
     }
 
     prompt_content = (
-        "Based on the following project context files, please recommend the next logical development path or project. "
-        "Be concise and provide a clear, actionable recommendation. Focus on areas that would most effectively advance the 'music manifold' concept.\n\n"
+        "You are the project lead. Your job is to analyze the current state from the provided files, ESPECIALLY 'internal/STATUS.md', and generate the content for 'GPT_NEXT.md'.\n\n"
+        "CRITICAL RULES:\n"
+        "1. **Read internal/STATUS.md FIRST.** If the status is 'FAILED' or 'STUCK', your ONLY goal is to propose debugging steps. Do NOT suggest new features.\n"
+        "2. **Be Brutally Honest.** Do not use phrases like 'great progress' or 'promising results' if the metrics (Oracle Distance) are stagnant. Call a failure a failure.\n"
+        "3. **Ignore Future Fluff.** Do not talk about 'Real Music', 'RBIE', or 'Advanced Synthesis' until the basic synthetic oscillator is solved (Oracle Distance < 0.05).\n"
+        "4. **Focus on the Bottleneck.** If the model isn't learning, suggest architectural simplifications, gradient checks, or sanity tests (e.g., overfitting a single batch).\n"
+        "5. **Output Format**: Markdown. Clear, actionable steps. No corporate speak.\n\n"
+        "Context Files:\n"
         + "\n".join(context_files_content)
     )
 
     data = {
         "model": "gpt-5.1",
         "messages": [
-            {"role": "system", "content": "You are an expert software architect and project manager, specializing in music technology, machine learning, and mathematical modeling."},
+            {"role": "system", "content": "You are a principal research engineer at DeepMind. You are rigorous, skeptical, and focused on empirical results. You despise 'hype' and 'hallucinated progress'. You prioritize solving the immediate blocker over planning grand visions."},
             {"role": "user", "content": prompt_content}
         ],
         "max_completion_tokens": 100000, # User specified 100000 tokens
