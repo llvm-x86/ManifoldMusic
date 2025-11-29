@@ -157,7 +157,7 @@ $$\mathcal{L}_{total} = \mathcal{L}_{recon} + \mathcal{L}_{recon\_vae} + \lambda
 
 The model fills gaps in sequences using **Autoregressive Dynamics Rollout**, leveraging the learned Manifold ODE to physically simulate the system's evolution across the missing region.
 
-![Imputation Demo](imputation_demo.png)
+![Imputation Demo](outputs/imputation_demo.png)
 
 ```python
 def geodesic_imputation(model, params, sequence_with_gap, gap_start, gap_end):
@@ -186,7 +186,7 @@ def geodesic_imputation(model, params, sequence_with_gap, gap_start, gap_end):
 
 The model learns stable **limit cycles** on the manifold, corresponding to the periodic nature of the musical signals.
 
-![Phase Portrait](phase_portrait.png)
+![Phase Portrait](outputs/phase_portrait.png)
 
 The phase portrait (projected via PCA) shows the latent state trajectory evolving in a closed loop, confirming that the **Neural Kuramoto Dynamics** have successfully captured the phase and frequency of the underlying polyphonic signal. The arrows indicate the direction of time, showing a stable, continuous flow.
 
