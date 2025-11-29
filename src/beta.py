@@ -696,7 +696,7 @@ def main():
     impute_key, _ = jrandom.split(key)
     imputed_output = geodesic_imputation(model, state.params, input_with_gap, gap_start_idx, gap_end_idx, impute_key)
     
-    save_audio(imputed_output, "imputed_audio_sample.wav")
+    save_audio(imputed_output, "outputs/imputed_audio_sample.wav")
     
     plt.figure(figsize=(15, 6))
     time_steps = np.arange(seq_len)
@@ -713,7 +713,7 @@ def main():
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("beta_imputation_demo.png")
+    plt.savefig("outputs/beta_imputation_demo.png")
     plt.close()
     print("Saved 'beta_imputation_demo.png'")
 
@@ -721,7 +721,7 @@ def main():
     # Get latent trajectory for the sample input
     # Use the mean (mu) for the phase portrait to show the "clean" manifold
     _, _, z_sample_mu, _ = model.apply({'params': state.params}, sample_input[None, ...], key, method=lambda m, x, rng: m.vae(x, rng))
-    plot_phase_portrait(z_sample_mu[0])
+    plot_phase_portrait(z_sample_mu[0], filename="outputs/phase_portrait.png")
 
 if __name__ == '__main__':
     main()
